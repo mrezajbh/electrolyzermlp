@@ -1,0 +1,358 @@
+using LinearAlgebra, SparseArrays, Printf, DelimitedFiles, Statistics
+using Plots
+import XLSX
+
+# -----------------------
+# Constants
+# -----------------------
+const F  = 96485.3329
+const Rg = 8.314462618
+const atm = 101325.0
+
+# -----------------------
+# Membrane and operating conditions (PEM electrolyzer orientation)
+# -----------------------
+const Lm   = 25e-6          # membrane thickness [m]
+const T    = 353.15         # K
+const RH   = 1.0            # 0..1
+const n_drag = 2.5
+const cH2O_eff = 5.55e4     # mol/m^3
+const use_drag = false
+
+# Cathode produces H2; Anode produces O2
+pH2_ca(t) = 1.0*atm         # hydrogen partial pressure at cathode side
+pH2_an(t) = 0.0
+pO2_an(t) = 1.0*atm         # oxygen partial pressure at anode side
+pO2_ca(t) = 0.0
+
+# Applied current density for electro-osmotic drift (optional)
+i_app(t)  = 0.0             # A/m^2
+v_d(t)    = use_drag ? (n_drag * i_app(t) / F) / cH2O_eff : 0.0  # m/s anode→cathode
+
+
+
+
+
+# -----------------------
+# Transport properties, Arrhenius + simple RH hooks
+# -----------------------
+const Tref_P  = 353.15      # K, permeability ref
+const Tref_D  = 293.15      # K, diffusivity ref
+
+# O2 in ionomer (representative, consistent with Nafion-class data)
+const D_ref_O2 = 2.23e-12
+const P_ref_O2_Pa  = 1.6e-14
+const Ea_D_O2 = 12.6e3
+const Ea_P_O2 = 23e3
+scale_D_O2_RH(rh) = 0.6 + 0.4*clamp(rh,0,1)
+scale_H_O2_RH(rh) = 1.2 - 0.2*clamp(rh,0,1)
+
+# H2 in ionomer (representative for PFSA)
+const D_ref_H2 = 1.0e-11
+const P_ref_H2_Pa  = 3.85e-14
+const Ea_D_H2 = 10e3
+const Ea_P_H2 = 27e3
+scale_D_H2_RH(rh) = 0.6 + 0.4*clamp(rh,0,1)
+scale_H_H2_RH(rh) = 1.2 - 0.2*clamp(rh,0,1)
+
+@inline arrhenius(xref, Ea, T, Tref) = xref * exp(-(Ea/Rg) * (1/T - 1/Tref))
+
+# Build D(T,RH), H(T,RH), P = D*H
+function props_O2(T, RH)
+    D = arrhenius(D_ref_O2, Ea_D_O2, T, Tref_D) * scale_D_O2_RH(RH)
+    P = arrhenius(P_ref_O2_Pa, Ea_P_O2, T, Tref_P)
+    H = P / D * scale_H_O2_RH(RH)
+    return D, H, P
+end
+function props_H2(T, RH)
+    D = arrhenius(D_ref_H2, Ea_D_H2, T, Tref_D) * scale_D_H2_RH(RH)
+    P = arrhenius(P_ref_H2_Pa, Ea_P_H2, T, Tref_P)
+    H = P / D * scale_H_H2_RH(RH)
+    return D, H, P
+end
+
+# -----------------------
+# Mesh and helpers
+# -----------------------
+struct Mesh1D
+    x::Vector{Float64}
+    h::Float64
+    N::Int
+end
+function line_mesh(L, Ne::Int)
+    x = collect(range(0.0, L; length=Ne+1))
+    Mesh1D(x, L/Ne, Ne+1)
+end
+
+function mass_lumped(m::Mesh1D)
+    d = fill(m.h, m.N); d[1] = m.h/2; d[end] = m.h/2
+    spdiagm(0 => d)
+end
+
+function diffusion_stiffness(m::Mesh1D, D::Float64)
+    Ke = (D/m.h) * [1.0 -1.0; -1.0 1.0]
+    K = spzeros(m.N, m.N)
+    for e in 1:m.N-1
+        n1, n2 = e, e+1
+        @inbounds begin
+            K[n1,n1] += Ke[1,1]; K[n1,n2] += Ke[1,2]
+            K[n2,n1] += Ke[2,1]; K[n2,n2] += Ke[2,2]
+        end
+    end
+    K
+end
+
+# conservative upwind advection RHS for constant v
+function advective_rhs_upwind(m::Mesh1D, c::Vector{Float64}, v::Float64, cL_face::Float64, cR_face::Float64)
+    F = similar(c, m.N+1)
+    F[1] = v ≥ 0 ? v*cL_face : v*c[1]
+    for j in 2:m.N
+        F[j] = v ≥ 0 ? v*c[j-1] : v*c[j]
+    end
+    F[m.N+1] = v ≥ 0 ? v*c[end] : v*cR_face
+    a = zeros(m.N)
+    a[1] = (F[2]-F[1])/m.h
+    for i in 2:m.N-1
+        a[i] = (F[i+1]-F[i])/m.h
+    end
+    a[end] = (F[m.N+1]-F[m.N])/m.h
+    return -a
+end
+
+# Robin BC assembly for implicit operator: add k at boundary nodes and k*c_sat to RHS
+function add_robin!(K::SparseMatrixCSC, rhs::Vector{Float64}; kL=0.0, c_sat_L=0.0, kR=0.0, c_sat_R=0.0, θ=1.0, c_prev_L=0.0, c_prev_R=0.0)
+    # θ-method splitting of linear term k c: θ*k to LHS; (1-θ)*k*c_prev to RHS
+    if kL != 0.0
+        K[1,1] += θ*kL
+        rhs[1] += (1-θ)*kL*c_prev_L + kL*c_sat_L
+    else
+        rhs[1] += 0.0
+    end
+    if kR != 0.0
+        K[end,end] += θ*kR
+        rhs[end] += (1-θ)*kR*c_prev_R + kR*c_sat_R
+    else
+        rhs[end] += 0.0
+    end
+end
+
+# one-sided boundary fluxes including advection
+function flux_at_faces(m::Mesh1D, c::Vector{Float64}, D::Float64, v::Float64, cL_face::Float64, cR_face::Float64)
+    dcL = (-3c[1] + 4c[2] - c[3]) / (2m.h)
+    dcR = ( 3c[end] - 4c[end-1] + c[end-2]) / (2m.h)
+    JL = -D*dcL + v*(v ≥ 0 ? cL_face : c[1])
+    JR = -D*dcR + v*(v ≥ 0 ? c[end]  : cR_face)
+    return JL, JR
+end
+
+# volumetric degassing sink S = k_deg * max(0, c - c_sat_bulk)
+function degassing_sink(c::Vector{Float64}, c_sat_bulk::Float64, k_deg::Float64)
+    if k_deg <= 0.0
+        return zeros(length(c))
+    end
+    @. k_deg * max(0.0, c - c_sat_bulk)
+end
+
+# one species implicit diffusion + Robin, explicit advection and degassing
+function step_species!(c::Vector{Float64}; m::Mesh1D, Δt, θ, D, v, cL_face, cR_face, M,
+                       kL, c_sat_L, kR, c_sat_R, k_deg, c_sat_bulk)
+
+    Kd = diffusion_stiffness(m, D)
+    LHS = (M/Δt) + θ*Kd
+    RHS = (M/Δt)*c - (1-θ)*Kd*c + advective_rhs_upwind(m, c, v, cL_face, cR_face)
+
+    # add Robin terms
+    add_robin!(LHS, RHS; kL=kL, c_sat_L=c_sat_L, kR=kR, c_sat_R=c_sat_R, θ=θ, c_prev_L=c[1], c_prev_R=c[end])
+
+    # explicit volumetric degassing sink
+    Sdeg = degassing_sink(c, c_sat_bulk, k_deg)
+    RHS .-= Sdeg
+
+    # solve
+    cnew = LHS \ RHS
+    @inbounds for i in 1:m.N
+        cnew[i] = max(cnew[i], 0.0)
+    end
+    return cnew
+end
+
+
+
+function icross_theory(; P_H2, P_O2, L, dpH2=1.0*atm, dpO2=1.0*atm)
+    JH2 = P_H2*dpH2/L
+    JO2 = P_O2*dpO2/L
+    return 2F*JH2 + 4F*JO2   # A/m^2
+end
+
+
+# -----------------------
+# Runner
+# -----------------------
+function run_transient(; Ne=250, Δt=0.05, tF=30.0, θ=1.0, save_every=100,
+                        out_dir="out", out_prefix="pem_xover",
+                        # interfacial desorption mass-transfer coefficients [m/s]
+                        kH2_L=0.0, kH2_R=1e-4,   # H2 desorbs at cathode (right) in PEMWE
+                        kO2_L=1e-4, kO2_R=0.0,   # O2 desorbs at anode (left)
+                        # optional volumetric degassing inside membrane
+                        kdeg_H2=0.0, kdeg_O2=0.0)
+
+    mkpath(out_dir)
+    m = line_mesh(Lm, Ne)
+    M = mass_lumped(m)
+
+    D_O2, H_O2, P_O2 = props_O2(T, RH)
+    D_H2, H_H2, P_H2 = props_H2(T, RH)
+    # theory line using current props and actual Δp across the membrane
+    dpH2 = pH2_ca(0.0) - pH2_an(0.0)   # cathode − anode
+    dpO2 = pO2_an(0.0) - pO2_ca(0.0)   # anode − cathode
+    ith = icross_theory(P_H2=P_H2, P_O2=P_O2, L=Lm, dpH2=dpH2, dpO2=dpO2)
+
+
+    @printf "Props @ T=%.1f K RH=%.0f%%\n" T RH*100
+    @printf "O2: D=%.3e m^2/s  H=%.3e mol m^-3 Pa^-1  P=%.3e mol m^-1 s^-1 Pa^-1\n" D_O2 H_O2 P_O2
+    @printf "H2: D=%.3e m^2/s  H=%.3e mol m^-3 Pa^-1  P=%.3e mol m^-1 s^-1 Pa^-1\n" D_H2 H_H2 P_H2
+
+    # state
+    cO2 = zeros(m.N)
+    cH2 = zeros(m.N)
+
+    # logs
+    times = Float64[]
+    JH2_L = Float64[]; JH2_R = Float64[]
+    JO2_L = Float64[]; JO2_R = Float64[]
+    i_cross = Float64[]
+    MB_resid = Float64[]      # mass balance residual [mol m^-2 s^-1], see below
+    snaps = Dict{Float64,Tuple{Vector{Float64},Vector{Float64}}}()
+
+    # helper for total storage [mol m^-2]
+    function storage(c)
+        # integral c dx via lumped mass diagonal
+        sum(diag(M) .* c)
+    end
+
+    t = 0.0
+    nsteps = Int(round(tF/Δt))
+    cO2_prev = copy(cO2)
+    cH2_prev = copy(cH2)
+
+    for k in 1:nsteps
+        t += Δt
+        vd = v_d(t)
+
+        # Henry solubilities at faces
+        cH2_L_face = H_H2 * pH2_an(t)  # left face (anode side) H2
+        cH2_R_face = H_H2 * pH2_ca(t)  # right face (cathode side) H2
+        cO2_L_face = H_O2 * pO2_an(t)  # left face (anode) O2
+        cO2_R_face = H_O2 * pO2_ca(t)  # right face (cathode) O2
+
+        # step each species
+        cH2 = step_species!(cH2; m, Δt, θ, D=D_H2, v=vd, cL_face=cH2_L_face, cR_face=cH2_R_face, M,
+                            kL=kH2_L, c_sat_L=cH2_L_face, kR=kH2_R, c_sat_R=cH2_R_face,
+                            k_deg=kdeg_H2, c_sat_bulk=cH2_R_face)   # H2 supersat w.r.t cathode gas
+        cO2 = step_species!(cO2; m, Δt, θ, D=D_O2, v=vd, cL_face=cO2_L_face, cR_face=cO2_R_face, M,
+                            kL=kO2_L, c_sat_L=cO2_L_face, kR=kO2_R, c_sat_R=cO2_R_face,
+                            k_deg=kdeg_O2, c_sat_bulk=cO2_L_face)   # O2 supersat w.r.t anode gas
+
+        # boundary fluxes (total: diffusion + advection) into +x
+        jL_H2, jR_H2 = flux_at_faces(m, cH2, D_H2, vd, cH2_L_face, cH2_R_face)
+        jL_O2, jR_O2 = flux_at_faces(m, cO2, D_O2, vd, cO2_L_face, cO2_R_face)
+
+        # crossover current density
+        # use the gas that reaches the opposite side
+        iH2 = 2*F * max(-jL_H2, 0.0)   # H2 exiting at anode (x=0)
+        iO2 = 4*F * max( jR_O2, 0.0)   # O2 exiting at cathode (x=L)
+        push!(i_cross, iH2 + iO2)
+
+
+        push!(times, t)
+        push!(JH2_L, jL_H2); push!(JH2_R, jR_H2)
+        push!(JO2_L, jL_O2); push!(JO2_R, jR_O2)
+
+        # mass balance residual check for both species combined:
+        # d/dt ∫(cH2+cO2)dx − [ (J_total_in at x=0) − (J_total_out at x=L) ] + sinks ≈ 0
+        # Here sinks are explicit volumetric degassing already subtracted in RHS, so we evaluate residual numerically
+        dM = (storage(cH2) - storage(cH2_prev) + storage(cO2) - storage(cO2_prev)) / Δt
+        netJ = (jL_H2 + jL_O2) - (jR_H2 + jR_O2)
+        push!(MB_resid, dM - netJ)
+        cH2_prev .= cH2; cO2_prev .= cO2
+
+        if k % save_every == 0 || k == nsteps
+            snaps[t] = (copy(cH2), copy(cO2))
+            @printf "t=%.2f s  i_cross=%.3e A/m^2  |σ_H2,R=%.3f  σ_O2,L=%.3f|  MBres=%.2e\n" t (iH2+iO2) (maximum(cH2)/max(cH2_R_face,1e-30)) (maximum(cO2)/max(cO2_L_face,1e-30)) MB_resid[end]
+        end
+    end
+
+    # final snapshots and supersaturation profiles vs producer sides
+    tlast = maximum(keys(snaps))
+    cH2_last, cO2_last = snaps[tlast]
+    cH2_sat_R = H_H2 * pH2_ca(tlast) .+ 0.0
+    cO2_sat_L = H_O2 * pO2_an(tlast) .+ 0.0
+    σH2 = cH2_last ./ max(cH2_sat_R, 1e-30)
+    σO2 = cO2_last ./ max(cO2_sat_L, 1e-30)
+
+    # CSVs
+    open(joinpath(out_dir, "$(out_prefix)_final_profile.csv"),"w") do io
+        println(io, "x,cH2,cO2")
+        for i in 1:m.N
+            println(io, "$(m.x[i]),$(cH2_last[i]),$(cO2_last[i])")
+        end
+    end
+    open(joinpath(out_dir, "$(out_prefix)_supersat_profile.csv"),"w") do io
+        println(io, "x,σH2_cathode,σO2_anode")
+        for i in 1:m.N
+            println(io, "$(m.x[i]),$(σH2[i]),$(σO2[i])")
+        end
+    end
+    open(joinpath(out_dir, "$(out_prefix)_flux_time.csv"),"w") do io
+        println(io, "t,JH2_L,JH2_R,JO2_L,JO2_R,i_cross,MB_resid")
+        for i in 1:length(times)
+            println(io, "$(times[i]),$(JH2_L[i]),$(JH2_R[i]),$(JO2_L[i]),$(JO2_R[i]),$(i_cross[i]),$(MB_resid[i])")
+        end
+    end
+
+    # Excel workbook
+    XLSX.openxlsx(joinpath(out_dir, "$(out_prefix).xlsx"), mode="w") do xf
+        sheet1 = XLSX.addsheet!(xf, "final_profile")
+        XLSX.writetable!(sheet1,
+                         (m.x, cH2_last, cO2_last),
+                         ["x_m","cH2","cO2"];
+                         anchor_cell = XLSX.CellRef("A1"))
+
+        sheet2 = XLSX.addsheet!(xf, "flux_time")
+        XLSX.writetable!(sheet2,
+                         (times, JH2_L, JH2_R, JO2_L, JO2_R, i_cross, MB_resid),
+                         ["t_s","JH2_L","JH2_R","JO2_L","JO2_R","i_cross","MB_resid"];
+                         anchor_cell = XLSX.CellRef("A1"))
+
+        sheet3 = XLSX.addsheet!(xf, "supersaturation")
+        XLSX.writetable!(sheet3,
+                         (m.x, σH2, σO2),
+                         ["x_m","sigma_H2_cathode","sigma_O2_anode"];
+                         anchor_cell = XLSX.CellRef("A1"))
+    end
+
+    # Plots
+    p1 = plot(title="Dissolved gases across membrane at t=$(round(tlast,digits=2)) s",
+              xlabel="x [μm]", ylabel="c [mol m⁻³]")
+    plot!(p1, m.x .* 1e6, cH2_last, label="H2")
+    plot!(p1, m.x .* 1e6, cO2_last, label="O2")
+    savefig(p1, joinpath(out_dir, "$(out_prefix)_profiles.png"))
+
+    p2 = plot(times, i_cross, xlabel="t [s]", ylabel="i_cross [A m⁻²]",
+              title="Crossover current density vs time", label="i_cross")
+    savefig(p2, joinpath(out_dir, "$(out_prefix)_icross.png"))
+
+    p3 = plot(title="Fluxes at faces", xlabel="t [s]", ylabel="Flux [mol m⁻² s⁻¹]")
+    plot!(p3, times, JH2_R, label="H2 at cathode (+L)")
+    plot!(p3, times, -JO2_L, label="O2 into anode (0)")
+    savefig(p3, joinpath(out_dir, "$(out_prefix)_fluxes.png"))
+
+    p4 = plot(times, MB_resid, xlabel="t [s]", ylabel="residual [mol m⁻² s⁻¹]",
+              title="Mass balance residual (storage − net flux)", label="residual")
+    savefig(p4, joinpath(out_dir, "$(out_prefix)_massbalance.png"))
+
+    @info "Wrote outputs to: $(abspath(out_dir))"
+end
+
+# run
+run_transient()
